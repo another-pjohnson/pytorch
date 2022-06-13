@@ -1,7 +1,11 @@
 import bisect
+import contextlib
+from enum import Enum, auto
+import functools
 import itertools
 import math
-from typing import Any, Dict, List, Tuple, Optional
+from types import FunctionType
+from typing import Any, Callable, Dict, Iterator, List, Tuple, Optional
 
 import torch
 import torch.distributed as dist
@@ -13,6 +17,7 @@ from torch.distributed._shard.sharding_spec import (
     EnumerableShardingSpec,
     ShardingSpec,
 )
+from torch.utils._pytree import tree_map
 
 
 def _sharding_spec_to_offsets(
@@ -188,3 +193,157 @@ def _gather_state_dict(
             tensor = output_tensor
         new_state_dict[key] = tensor
     return new_state_dict
+
+@contextlib.contextmanager
+def no_dispatch() -> Iterator[None]:
+    guard = torch._C._DisableTorchDispatch()  # type: ignore[attr-defined]
+    try:
+        yield
+    finally:
+        del guard
+
+class BypassState(Enum):
+    WRAPPER_ONLY = auto()
+    WRAPPED_ONLY = auto()
+    AUTOMATIC = auto()
+
+class bypass_state(object):
+    # only support @decorator, and not @decorator()
+    def __init__(self, *args):
+        self.new_state = BypassState.WRAPPER_ONLY
+        self.old_value = None
+        self.func = None
+        if len(args) > 0:
+            if isinstance(args[0], Callable):
+                self.func = args[0]
+                if len(args) == 2:
+                    self.new_state = args[1]
+            else:
+                if len(args) != 1:
+                    raise ValueError("Only expected a single argument of type BypassState")
+                else:
+                    self.new_state = args[0]
+
+    def __enter__(self):
+        self.old_value = ShadowTensor.bypass_state
+        ShadowTensor.bypass_state = self.new_state
+
+    def __exit__(self, *args):
+        ShadowTensor.bypass_state = self.old_value
+
+    def __call__(self, *args, **kwargs):
+        def wrapper(*args, **kwargs):
+            with self:
+                result = self.func(*args, **kwargs)
+                return result
+
+        if self.func is None:
+            self.func = args[0]
+            return wrapper
+        else:
+            return wrapper(*args, **kwargs)
+
+    def __get__(self, instance, owner):
+        return functools.partial(self.__call__, instance)
+
+class ShadowTensor(torch.Tensor):
+    bypass_state: BypassState = BypassState.AUTOMATIC
+    @staticmethod
+    def __new__(
+        cls, tensor: torch.Tensor
+    ):
+        r = super(ShadowTensor, cls)._make_wrapper_subclass(cls, tensor.shape, dtype=tensor.dtype, requires_grad=tensor.requires_grad, device=tensor.device)  # type: ignore
+        object.__setattr__(r, "tensor", tensor)
+        return r
+
+    def __init__(self, *args, **kwargs):
+        pass
+
+    def __getattribute__(self, name: str) -> Any:
+        #print(f"__getattribute__ for name: {name}")
+        local_state = ShadowTensor.bypass_state
+        # local state overrides global state
+        if "_wrapper_" in name:
+            name = name.replace("_wrapper_", "")
+            local_state = BypassState.WRAPPER_ONLY
+        elif "_wrapped_" in name:
+            name = name.replace("_wrapped_", "")
+            local_state = BypassState.WRAPPED_ONLY
+        if local_state == BypassState.WRAPPER_ONLY:
+            return object.__getattribute__(self, name)
+        elif local_state == BypassState.WRAPPED_ONLY:
+            return object.__getattribute__(self, "tensor").__getattribute__(name)
+        #elif name in ["__torch_function__", "__torch_dispatch__", "_grad", "grad", "grad_fn"]:
+        elif name in ["__torch_function__", "__torch_dispatch__", "grad_fn"]:
+            return object.__getattribute__(self, name)
+        else:
+            return object.__getattribute__(self, "tensor").__getattribute__(name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        #print(f"__setattr__ for name: {name}")
+        local_state = ShadowTensor.bypass_state
+        # local state overrides global state
+        if "_wrapper_" in name:
+            name = name.replace("_wrapper_", "")
+            local_state = BypassState.WRAPPER_ONLY
+        elif "_wrapped_" in name:
+            name = name.replace("_wrapped_", "")
+            local_state = BypassState.WRAPPED_ONLY
+        if local_state == BypassState.WRAPPER_ONLY:
+            object.__setattr__(self, name, value)
+        elif local_state == BypassState.WRAPPED_ONLY:
+            object.__getattribute__(self, "tensor").__setattr__(name, value)
+        #elif name in ["_grad", "grad"]:
+            #object.__setattr__(self, name, value)
+        else:
+            object.__getattribute__(self, "tensor").__setattr__(name, value)
+
+    def __delattr__(self, name: str) -> None:
+        #print(f"__delattr__ for name: {name}")
+        local_state = ShadowTensor.bypass_state
+        # local state overrides global state
+        if "_wrapper_" in name:
+            name = name.replace("_wrapper_", "")
+            local_state = BypassState.WRAPPER_ONLY
+        elif "_wrapped_" in name:
+            name = name.replace("_wrapped_", "")
+            local_state = BypassState.WRAPPED_ONLY
+        if local_state == BypassState.WRAPPER_ONLY:
+            object.__delattr__(self, name)
+        elif local_state == BypassState.WRAPPED_ONLY:
+            object.__getattribute__(self, "tensor").__delattr__(name)
+        else:
+            object.__getattribute__(self, "tensor").__delattr__(name)
+
+    __torch_function__ = torch._C._disabled_torch_function_impl
+
+    @classmethod
+    def __torch_dispatch__(cls, func, types, args=(), kwargs=None):  # type: ignore
+        func_name = func.overloadpacket.__name__
+        #print(f"ShadowTensor dispatch for func: {func_name}")
+        def unwrap(e: Any) -> torch.Tensor:
+            if isinstance(e, ShadowTensor):
+                with bypass_state():
+                    t = e.tensor
+                return t
+            else:
+                return e
+        def wrap(e):
+            if func_name.startswith("split") or func_name.startswith("view"):
+                return ShadowTensor(e)
+            else:
+                return e
+
+        # no_dispatch is only needed if you use enable_python_mode.
+        # It prevents infinite recursion.
+        with no_dispatch():
+            r = tree_map(wrap, func(*tree_map(unwrap, args), **tree_map(unwrap, kwargs)))
+        return r
+
+class ShadowParameter(ShadowTensor, torch.nn.Parameter):
+    def __new__(cls, tensor):
+        param = tensor
+        if not isinstance(tensor, torch.nn.Parameter):
+            param = torch.nn.Parameter(tensor)
+        return super(ShadowParameter, cls).__new__(cls, param)
+

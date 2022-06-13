@@ -32,7 +32,7 @@ def _apply_to_tensors(
                 od[key] = apply(value)
             return od
         elif isinstance(x, PackedSequence):
-            apply(x.data)
+            apply(x)
             return x
         elif isinstance(x, dict):
             return {key: apply(value) for key, value in x.items()}

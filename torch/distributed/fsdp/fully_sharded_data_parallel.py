@@ -69,6 +69,8 @@ from .flatten_params_wrapper import (
     FlatParameter,
     FlattenParamsWrapper,
 )
+
+from .shard_utils import BypassState, bypass_state, ShadowParameter
 from .wrap import _or_policy, _recursive_wrap, _wrap_batchnorm_individually
 
 _TORCHDISTX_AVAIL = True
@@ -836,7 +838,7 @@ class FullyShardedDataParallel(nn.Module):
 
         # Make sure all parameters are sharded.
         for n, p in self.named_parameters():
-            if p not in ignored_params and not isinstance(p, FlatParameter):
+            if p not in ignored_params and not (isinstance(p, FlatParameter) or isinstance(p, ShadowParameter)):
                 raise RuntimeError(
                     f"found unflattened parameter: {n} ; {p.size()} {p.__class__}"
                 )
@@ -1162,7 +1164,7 @@ class FullyShardedDataParallel(nn.Module):
         if p.device == cpu_device:
             return
         with torch.no_grad():
-            p.data = p.to(cpu_device)
+            p._wrapper_tensor = p.to(cpu_device)
 
     def _mixed_precision_enabled_for_params(self) -> bool:
         """
@@ -1230,16 +1232,16 @@ class FullyShardedDataParallel(nn.Module):
         ), "Expected to only be called when mixed precision for parameters is enabled."
         with torch.cuda.stream(self._streams["mixed_precision_params"]):
             for p in self.params:
-                assert p._mp_shard is not None
-                _alloc_storage(data=p._mp_shard, size=p._local_shard.size())
+                assert p._wrapper_mp_shard is not None
+                _alloc_storage(data=p._wrapper_mp_shard, size=p._wrapper__local_shard.size())
                 # Cast is done by copy
-                p._mp_shard.copy_(
+                p._wrapper_mp_shard.copy_(
                     # no-op if not CPU offloading, otherwise nonblocking because
-                    # p._local_shard is pinned in _init_param_attributes.
-                    p._local_shard.to(p._mp_shard.device, non_blocking=True)
+                    # p._wrapper__local_shard is pinned in _init_param_attributes.
+                    p._wrapper__local_shard.to(p._wrapper_mp_shard.device, non_blocking=True)
                 )
                 # Point p to the mp shard
-                p.data = p._mp_shard
+                p._wrapper_tensor = p._wrapper_mp_shard
         # Block current stream on this copy work.
         torch.cuda.current_stream().wait_stream(self._streams["mixed_precision_params"])
 
@@ -1254,12 +1256,12 @@ class FullyShardedDataParallel(nn.Module):
         current_stream = torch.cuda.current_stream()
         for p in params:
             # mp_shard should always be allocated.
-            assert p._mp_shard is not None
+            assert p._wrapper_mp_shard is not None
             # Shard is allocated in "mixed_precision_stream" and then we block
             # current stream on this stream, so don't free it until work in the
             # current stream is completed.
-            p._mp_shard.record_stream(current_stream)
-            _free_storage(p._mp_shard)
+            p._wrapper_mp_shard.record_stream(current_stream)
+            _free_storage(p._wrapper_mp_shard)
 
     def _cast_buffers(
         self,
@@ -1338,20 +1340,21 @@ class FullyShardedDataParallel(nn.Module):
         data parallel workers.
         """
         for p in self.params:
-            assert not p._is_sharded, "Param should have not been sharded yet."
+
+            assert not p._wrapper__is_sharded, "Param should have not been sharded yet."
             assert (
                 p.is_floating_point()
             ), "Autograd does not support operations for integer type."
 
             # Sharding is done only when world_size is larger than 1 and
             # sharding_strategy!=NO_SHARD.
-            p._is_sharded = (  # type: ignore[attr-defined]
+            p._wrapper__is_sharded = (  # type: ignore[attr-defined]
                 self.world_size > 1
                 and self.sharding_strategy != ShardingStrategy.NO_SHARD
             )
-            p._orig_size = p.size()  # type: ignore[attr-defined]
+            p._wrapper__orig_size = p.size()  # type: ignore[attr-defined]
 
-            if not p._is_sharded:  # type: ignore[attr-defined]
+            if not p._wrapper__is_sharded:  # type: ignore[attr-defined]
                 self.numel_padded_per_param.append(0)
                 continue
 
@@ -1365,8 +1368,9 @@ class FullyShardedDataParallel(nn.Module):
 
             # Replace p with the relevant shard.
             local_shard, num_padded = self._get_shard(p)
-            p.set_(local_shard)  # type: ignore[call-overload]
-            p.shard_by_offsets(
+            local_shard.requires_grad = p._wrapper_tensor.requires_grad
+            p._wrapper_tensor = local_shard
+            p._wrapper_shard_by_offsets(
                 self.rank * local_shard.numel(),
                 (self.rank + 1) * local_shard.numel() - 1,
                 num_padded,
@@ -1456,10 +1460,10 @@ class FullyShardedDataParallel(nn.Module):
         self._fsdp_graph_order: List[nn.Module] = []
         self._my_fsdp_idx_in_graph: Optional[int] = None
         for p in self.params:
-            if hasattr(p, "_local_shard"):
+            if hasattr(p, "_wrapper__local_shard"):
                 # reset attributes that are added in _init_param_attributes, as
                 # part of _lazy_init
-                del p._local_shard  # type: ignore[attr-defined]
+                del p._wrapper__local_shard  # type: ignore[attr-defined]
         # set 'self.reshard_after_forward' flag based on self.sharding_strategy
         self._init_reshard_after_forward()
 
@@ -1502,44 +1506,44 @@ class FullyShardedDataParallel(nn.Module):
         """
         We manage several attributes on each Parameter instance. The first two
         are set by :func:`_shard_parameters`:
-            ``_is_sharded``: ``True`` if the Parameter is sharded or ``False``
+            ``_wrapper__is_sharded``: ``True`` if the Parameter is sharded or ``False``
                 if the Parameter is intentionally not sharded (in which case we
                 will all-reduce grads for this param). Currently the way
-                `_is_sharded = False` is if world_size = 1 or sharding strategy
+                `_wrapper__is_sharded = False` is if world_size = 1 or sharding strategy
                 is NO_SHARD.
-            ``_orig_size``: the size of the original Parameter (before sharding)
+            ``_wrapper__orig_size``: the size of the original Parameter (before sharding)
         A few attributes are set here:
-            ``_local_shard``: a single shard of the parameter. This is needed to
+            ``_wrapper__local_shard``: a single shard of the parameter. This is needed to
                 recover the shard after rebuilding full parameter in forward
                 and backward.
-            ``_full_param_padded``: the full weight (padded to be evenly
+            ``_wrapper__full_param_padded``: the full weight (padded to be evenly
                 divisible by ``world_size``), used for computation in the
                 forward and backward pass. It is initialized with the
                 appropriate size and then has its storage freed. This will be
                 resized in place and only materialized (via all-gather) as needed.
         Another attribute is set by :func:`_register_post_backward_hooks`:
-            ``_shard_bwd_hook``: it holds the parameter's AccumulateGrad object
+            ``_wrapper__shard_bwd_hook``: it holds the parameter's AccumulateGrad object
                 and the registered post hook handle.
         """
-        assert hasattr(p, "_is_sharded") and hasattr(
-            p, "_orig_size"
+        assert hasattr(p, "_wrapper__is_sharded") and hasattr(
+            p, "_wrapper__orig_size"
         ), "Parameters should have been sharded during construction."
-        # If _local_shard has been set in the first lazy init and
-        # current parameter is pointed to _local_shard, no need to
-        # set the _local_shard again.
-        if hasattr(p, "_local_shard"):
-            # If CPU offloading, p._local_shard should have been placed on CPU
+        # If _wrapper__local_shard has been set in the first lazy init and
+        # current parameter is pointed to _wrapper__local_shard, no need to
+        # set the _wrapper__local_shard again.
+        if hasattr(p, "_wrapper__local_shard"):
+            # If CPU offloading, p._wrapper__local_shard should have been placed on CPU
             # during its first lazy construction.
             if self.cpu_offload.offload_params:
-                assert p._local_shard.device == torch.device(  # type: ignore[attr-defined]
+                assert p._wrapper__local_shard.device == torch.device(  # type: ignore[attr-defined]
                     "cpu"
                 ), (
-                    "Expected p._local_shard to be on CPU, "  # type: ignore[attr-defined]
-                    f"but it's on {p._local_shard.device}"  # type: ignore[attr-defined]
+                    "Expected p._wrapper__local_shard to be on CPU, "  # type: ignore[attr-defined]
+                    f"but it's on {p._wrapper__local_shard.device}"  # type: ignore[attr-defined]
                 )
             return
 
-        # A single shard of the parameters. Also makes p._local_shard to be on
+        # A single shard of the parameters. Also makes p._wrapper__local_shard to be on
         # CPU if we are CPU offloading, since p.data would be on CPU during
         # init.
         if self.cpu_offload.offload_params:
@@ -1548,17 +1552,17 @@ class FullyShardedDataParallel(nn.Module):
                 "If CPU offloading is enabled correctly, you may be "
                 "accidentally moving the model to CUDA after FSDP initialization."
             )
-        p._local_shard = p.data  # type: ignore[attr-defined]
+        p._wrapper__local_shard = p._wrapper_tensor  # type: ignore[attr-defined]
         # If CPU offloading, pin the memory to enable faster CPU -> GPU device
         # transfer.
         if self.cpu_offload.offload_params:
-            assert p._local_shard.device == torch.device("cpu")  # type: ignore[attr-defined]
-            p._local_shard.pin_memory()  # type: ignore[attr-defined]
+            assert p._wrapper__local_shard.device == torch.device("cpu")  # type: ignore[attr-defined]
+            p._wrapper__local_shard.pin_memory()  # type: ignore[attr-defined]
             # When offloading parameters, also move the grad shard to CPU during
             # backward pass. In this case, it's important to pre-allocate the
             # CPU grad shard in pinned memory so that we can do a non-blocking
             # transfer.
-            p._cpu_grad = torch.zeros_like(  # type: ignore[attr-defined]
+            p._wrapper__cpu_grad = torch.zeros_like(  # type: ignore[attr-defined]
                 p, device=torch.device("cpu")
             ).pin_memory()
 
@@ -1571,20 +1575,20 @@ class FullyShardedDataParallel(nn.Module):
         if (
             self._mixed_precision_enabled_for_params()
         ):
-            p._mp_shard = torch.zeros_like(
-                p._local_shard,
+            p._wrapper_mp_shard = torch.zeros_like(
+                p._wrapper__local_shard,
                 device=self.compute_device,
                 dtype=self.mixed_precision.param_dtype
             )
-            _free_storage(p._mp_shard)
+            _free_storage(p._wrapper_mp_shard)
 
         # We also maintain a full-sized parameter of type self.compute_dtype.
         # We resize the storage to size 0 at init (here) and only materialize
         # as needed. The storage may contain padding elements so that it is
         # evenly divisible by world_size, although these padding elements will
         # be removed before the relevant computation.
-        if p._is_sharded:  # type: ignore[attr-defined]
-            # We set p._full_param_padded's dtype to the desired parameter dtype
+        if p._wrapper__is_sharded:  # type: ignore[attr-defined]
+            # We set p._wrapper__full_param_padded's dtype to the desired parameter dtype
             # in the case of mixed precision. This is so that when we all_gather
             # into full_param_padded it can occur without issues and result in
             # full_param_padded having the expected param_dtype.
@@ -1592,12 +1596,12 @@ class FullyShardedDataParallel(nn.Module):
                 p.dtype if not self._mixed_precision_enabled_for_params()
                 else self.mixed_precision.param_dtype
             )
-            p._full_param_padded = torch.zeros(  # type: ignore[attr-defined]
+            p._wrapper__full_param_padded = torch.zeros(  # type: ignore[attr-defined]
                 p.numel() * self.world_size,
                 device=self.compute_device,
                 dtype=full_param_dtype,
             )
-            _free_storage(p._full_param_padded)  # type: ignore[attr-defined]
+            _free_storage(p._wrapper__full_param_padded)  # type: ignore[attr-defined]
 
     def _set_is_root(self) -> None:
         """If ``True``, implies that no other :class:`FullyShardedDataParallel`
@@ -1997,7 +2001,7 @@ class FullyShardedDataParallel(nn.Module):
         elif self._state_dict_type == StateDictType.LOCAL_STATE_DICT:
             if (
                 self._fsdp_wrapped_module.flat_param is not None and
-                not self._fsdp_wrapped_module.flat_param._is_sharded
+                not self._fsdp_wrapped_module.flat_param._wrapper__is_sharded
             ):
                 raise RuntimeError(
                     "local_state_dict can only be called "
@@ -2114,7 +2118,7 @@ class FullyShardedDataParallel(nn.Module):
         if self._fsdp_wrapped_module.no_params:
             return
 
-        if not self._fsdp_wrapped_module.flat_param._is_sharded:
+        if not self._fsdp_wrapped_module.flat_param._wrapper__is_sharded:
             raise RuntimeError(
                 "load_sharded_state_dict can only be called when parameters "
                 "are flatten and sharded."
@@ -2125,7 +2129,7 @@ class FullyShardedDataParallel(nn.Module):
         # gather all the parameters in this layer. This can be achieved by
         # concatenated all the local shards and then append the padding.
         # https://github.com/pytorch/pytorch/issues/77461
-        for module_name, _, param_name in self._fsdp_wrapped_module.flat_param._param_infos:
+        for module_name, _, param_name in self._fsdp_wrapped_module.flat_param._wrapper__param_infos:
             module_name = module_name.replace(f"{FPW_MODULE}.", "")
             module_name = module_name.replace(f"{FPW_MODULE}", "")
             if module_name:
@@ -2313,13 +2317,13 @@ class FullyShardedDataParallel(nn.Module):
                 ):
                     self._free_mp_shard(self.params)
             # Switch to original local shards of params. We maintain this invariant throughout
-            # the code, i.e., ``p.data == p._local_shard`` after each function. This
+            # the code, i.e., ``p.data == p._wrapper__local_shard`` after each function. This
             # also ensures that after the first forward, the optimizer state will be
             # initialized with the correct dtype and (sharded) size, since optimizer
             # state is typically initialized lazily in ``optim.step()``. Note that
             # when CPU offload is enabled, _use_param_local_shard implicitly
             # offloads the local shard to CPU by making p.data point to
-            # p._local_shard, which would reside on CPU.
+            # p._wrapper__local_shard, which would reside on CPU.
             self._use_param_local_shard()
 
             # Register pre-backward hooks to all-gather the params for the backward
@@ -2338,14 +2342,14 @@ class FullyShardedDataParallel(nn.Module):
         Writes back full_params into self.params.
         """
         for p, (full_param, _) in zip(self.params, full_params):
-            if not p._is_sharded:  # type: ignore[attr-defined]
+            if not p._wrapper__is_sharded:  # type: ignore[attr-defined]
                 continue  # Already copied because no sharding.
 
             # TODO: Might be able to refactor to use _get_shard.
             chunks = full_param.chunk(self.world_size)  # type: ignore[attr-defined]
             assert len(chunks) > self.rank
             chunk = chunks[self.rank]
-            p._local_shard.copy_(chunk)  # type: ignore[attr-defined]
+            p._wrapper__local_shard.copy_(chunk)  # type: ignore[attr-defined]
 
     @contextlib.contextmanager
     def _summon_full_params(
@@ -2386,7 +2390,7 @@ class FullyShardedDataParallel(nn.Module):
 
             # when CPU offload is enabled, _use_param_local_shard implicitly
             # offloads the local shard to CPU by making p.data point to
-            # p._local_shard, which would reside on CPU.
+            # p._wrapper__local_shard, which would reside on CPU.
             self._use_param_local_shard()
 
         if recurse:
@@ -2422,9 +2426,9 @@ class FullyShardedDataParallel(nn.Module):
             my_rank = dist.get_rank(self.process_group)
             if offload_to_cpu and (not rank0_only or my_rank == 0):
                 for p in self.params:
-                    if p._is_sharded:
+                    if p._wrapper__is_sharded:
                         with torch.no_grad():
-                            # Note that we avoid using p._full_param_padded
+                            # Note that we avoid using p._wrapper__full_param_padded
                             # directly here as we may not be using that param
                             # as the full_param from _rebuild_full_params (i.e.)
                             # in mixed precision.
@@ -2451,10 +2455,10 @@ class FullyShardedDataParallel(nn.Module):
                     finally:
                         if offload_to_cpu:
                             for p in self.params:
-                                if p._is_sharded:
+                                if p._wrapper__is_sharded:
                                     with torch.no_grad():
                                         # Note that we avoid using
-                                        # p._full_param_padded directly here as
+                                        # p._wrapper__full_param_padded directly here as
                                         # we may not be using that param
                                         # as the full_param from
                                         # _rebuild_full_params (i.e. in mixed
@@ -2664,6 +2668,7 @@ class FullyShardedDataParallel(nn.Module):
 
         return outputs
 
+    @bypass_state(BypassState.WRAPPER_ONLY)
     def _register_post_backward_hooks(self) -> None:
         """
         Register backward hooks to reshard params and reduce-scatter grads.
@@ -2707,15 +2712,14 @@ class FullyShardedDataParallel(nn.Module):
                     p_tmp.grad_fn is not None
                 ), "p_tmp grad_fn should not be None, it is used to access \
                     p's AccumulateGrad object and register post hook on it."
-                grad_acc = p_tmp.grad_fn.next_functions[0][
-                    0
-                ]  # Gets its AccumulateGrad object.
+                grad_acc = p_tmp.grad_fn.next_functions[0][0]  # Gets its AccumulateGrad object.
                 handle = grad_acc.register_hook(
                     functools.partial(self._post_backward_hook, p)
                 )
                 p._shard_bwd_hook = (grad_acc, handle)  # type: ignore[attr-defined]
 
     @torch.no_grad()
+    @bypass_state(BypassState.WRAPPER_ONLY)
     def _post_backward_hook(self, param: Parameter, *unused: Any) -> None:
         """
         At the start of :func:`_post_backward_hook`, ``param.grad`` contains the
@@ -2784,7 +2788,7 @@ class FullyShardedDataParallel(nn.Module):
             self._streams["post_backward"].wait_stream(torch.cuda.current_stream())
 
             with torch.cuda.stream(self._streams["post_backward"]):
-                orig_grad_data = param.grad.data
+                orig_grad = param.grad
                 if (
                     self._mixed_precision_enabled_for_reduce()
                 ):
@@ -2792,13 +2796,13 @@ class FullyShardedDataParallel(nn.Module):
                     # TODO: Make this a communication hook when communication hooks
                     # are implemented for FSDP. Note that this is a noop if the
                     # reduce_dtype matches the param dtype.
-                    param.grad.data = param.grad.data.to(self.mixed_precision.reduce_dtype)
+                    param.grad = param.grad.to(self.mixed_precision.reduce_dtype)
 
                 if self.gradient_predivide_factor > 1:
                     # Average grad by world_size for consistency with PyTorch DDP.
                     param.grad.div_(self.gradient_predivide_factor)
 
-                grad = param.grad.data
+                grad = param.grad
                 if param._is_sharded:  # type: ignore[attr-defined]
                     # We clear `param.grad` to permit repeated gradient
                     # computations when this FSDP module is called multiple times.
@@ -2835,10 +2839,10 @@ class FullyShardedDataParallel(nn.Module):
                     ):
                         # Cast gradients back to the full parameter precision so that
                         # optimizer.step() happens in full precision.
-                        orig_param_grad_data = output
-                        output.data = output.data.to(dtype=param.data.dtype)
+                        orig_param_grad = output
+                        output = output.to(dtype=param.dtype)
                         # Don't let this memory get reused until after the transfer.
-                        orig_param_grad_data.record_stream(torch.cuda.current_stream())
+                        orig_param_grad.record_stream(torch.cuda.current_stream())
 
                     # To support gradient accumulation outside `no_sync()`, we save
                     # the gradient data to `param._saved_grad_shard` before the
@@ -2885,10 +2889,10 @@ class FullyShardedDataParallel(nn.Module):
                     ):
                         # Cast gradients back to the full parameter precision so that
                         # optimizer.step() happens in full precision.
-                        orig_param_grad_data = param.grad.data
-                        param.grad.data = param.grad.data.to(dtype=param.data.dtype)
+                        orig_param_grad = param.grad
+                        param.grad = param.grad.to(dtype=param.dtype)
                         # Don't let this memory get reused until after the transfer.
-                        orig_param_grad_data.record_stream(torch.cuda.current_stream())
+                        orig_param_grad.record_stream(torch.cuda.current_stream())
 
                 # Regardless of sharding or not, offload the grad to CPU if we are
                 # offloading params. This is so param and grad reside on same device
@@ -2901,14 +2905,14 @@ class FullyShardedDataParallel(nn.Module):
                         grad.detach(), non_blocking=True
                     )
                     # Don't let this memory get reused until after the transfer.
-                    grad.data.record_stream(torch.cuda.current_stream())
+                    grad.record_stream(torch.cuda.current_stream())
 
-                # After _post_backward_hook returns, orig_grad_data will eventually
+                # After _post_backward_hook returns, orig_grad will eventually
                 # go out of scope, at which point it could otherwise be freed for
                 # further reuse by the main stream while the div/reduce_scatter/copy
                 # are underway in the post_backward stream. See:
                 # github.com/NVIDIA/apex/blob/master/apex/parallel/distributed.py
-                orig_grad_data.record_stream(self._streams["post_backward"])
+                orig_grad.record_stream(self._streams["post_backward"])
 
     def _queue_wait_for_post_backward(self) -> None:
         """Try to queue a `wait_for_post_backward` callback.
@@ -2953,44 +2957,45 @@ class FullyShardedDataParallel(nn.Module):
             """Helper used below on all fsdp modules."""
             for p in fsdp_module.params:
                 if p.requires_grad:
-                    if hasattr(p, "_shard_bwd_hook"):
-                        assert len(p._shard_bwd_hook) == 2 and len(  # type: ignore[attr-defined]
-                            p._shard_bwd_hook  # type: ignore[attr-defined]
+                    if hasattr(p, "_wrapper__shard_bwd_hook"):
+                        assert len(p._wrapper__shard_bwd_hook) == 2 and len(  # type: ignore[attr-defined]
+                            p._wrapper__shard_bwd_hook  # type: ignore[attr-defined]
                         ), (  # type: ignore[attr-defined]
-                            "p._shard_bwd_hook fields are not valid."
+                            "p._wrapper__shard_bwd_hook fields are not valid."
                         )
-                        p._shard_bwd_hook[1].remove()  # type: ignore[attr-defined]
-                        delattr(p, "_shard_bwd_hook")
+                        p._wrapper__shard_bwd_hook[1].remove()  # type: ignore[attr-defined]
+                        # no delattr override for Shadow Tensor
+                        delattr(p, "_wrapper__shard_bwd_hook")
                     # Preserve the gradient accumulation state if not
                     # synchronizing: `p.grad` remains the unsharded gradient
                     # accumulated from prior `no_sync()` iterations, and
-                    # `p._saved_grad_shard` remains the sharded gradient from
+                    # `p._wrapper__saved_grad_shard` remains the sharded gradient from
                     # the last synchronized iteration
                     if not self._require_backward_grad_sync:
                         continue
                     # Set `p.grad` as needed to ensure optimizer correctness
                     # since optimizers operate on the `grad` attribute
-                    if hasattr(p, "_cpu_grad"):
+                    if hasattr(p, "_wrapper__cpu_grad"):
                         p_assert(
                             p.device == torch.device("cpu"),
                             f"Device mismatch: p={p.device} "  # type: ignore[attr-defined]
-                            f"p._cpu_grad={p._cpu_grad}"
+                            f"p._wrapper__cpu_grad={p._wrapper__cpu_grad}"
                         )
-                        p.grad = p._cpu_grad  # type: ignore[attr-defined]
-                    elif hasattr(p, "_saved_grad_shard"):
+                        p.grad = p._wrapper__cpu_grad  # type: ignore[attr-defined]
+                    elif hasattr(p, "_wrapper__saved_grad_shard"):
                         p_assert(
-                            p.device == p._saved_grad_shard.device,  # type: ignore[attr-defined]
+                            p.device == p._wrapper__saved_grad_shard.device,  # type: ignore[attr-defined]
                             f"Device mismatch: p={p.device} "  # type: ignore[attr-defined]
-                            f"p._saved_grad_shard={p._saved_grad_shard.device}"
+                            f"p._wrapper__saved_grad_shard={p._wrapper__saved_grad_shard.device}"
                         )
-                        p.grad = p._saved_grad_shard  # type: ignore[attr-defined]
+                        p.grad = p._wrapper__saved_grad_shard  # type: ignore[attr-defined]
                     else:
                         p_assert(
-                            not p._is_sharded, "All sharded parameters should "
-                            "use `_saved_grad_shard`"
+                            not p._wrapper__is_sharded, "All sharded parameters should "
+                            "use `_wrapper__saved_grad_shard`"
                         )
-                    if hasattr(p, "_saved_grad_shard"):
-                        delattr(p, "_saved_grad_shard")
+                    if hasattr(p, "_wrapper__saved_grad_shard"):
+                        delattr(p, "_wrapper__saved_grad_shard")
 
         # Update root and nested FSDP's hooks and flags.
         for m in self.modules():  # includes self
@@ -3027,9 +3032,10 @@ class FullyShardedDataParallel(nn.Module):
         Args:
             output_tensor (torch.Tensor): this tensor contains the data we just gathered.
         """
-        p.data = output_tensor
+        output_tensor.requires_grad = p._wrapper_tensor.requires_grad
+        p._wrapper_tensor = output_tensor
         # Trim any padding and reshape to match original size.
-        p.data = p.data[: p._orig_size.numel()].view(p._orig_size)  # type: ignore[attr-defined]
+        p._wrapper_tensor = p._wrapper_tensor[: p._wrapper__orig_size.numel()].view(p._wrapper__orig_size)  # type: ignore[attr-defined]
 
     @torch.no_grad()
     def _rebuild_full_params(self) -> List[Tuple[torch.Tensor, bool]]:
@@ -3045,7 +3051,7 @@ class FullyShardedDataParallel(nn.Module):
         # free the full param, which currently occurs when the returned
         # parameter points to the unsharded param when world_size == 1, or when
         # we're returning the full parameter and reshard_after_forward=False
-        # (because we need to ensure p._full_param_padded stays intact)
+        # (because we need to ensure p._wrapper__full_param_padded stays intact)
         output_tensors: List[Tuple[torch.Tensor, bool]] = []
         with torch.cuda.stream(self._streams["all_gather"]):
             for p in self.params:
@@ -3059,82 +3065,81 @@ class FullyShardedDataParallel(nn.Module):
                     for p in self.params:
                         assert p.dtype == self.mixed_precision.param_dtype
                 # We can skip moving params to GPU if mixed precision, as p.data
-                # would then be pointing to p._mp_shard which is already on
+                # would then be pointing to p._wrapper_mp_shard which is already on
                 # self.compute_device.
                 if self.cpu_offload.offload_params and not mixed_precision_cast_ran:
                     # Move params to GPU if needed. Note that we don't use
-                    # self._full_param_padded.device here because the attr is
+                    # self._wrapper__full_param_padded.device here because the attr is
                     # not set always, i.e. when world_size=1 and
-                    # p._is_sharded = False. However when it is set, the
+                    # p._wrapper__is_sharded = False. However when it is set, the
                     # device is always self.compute_device.
-                    p.data = p.data.to(self.compute_device, non_blocking=True)
+                    p._wrapper_tensor = p.to(self.compute_device, non_blocking=True)
                 # Check the validity of this `_rebuild_full_params()` call in
                 # terms of execution order (regardless of if FSDP actually
                 # needs to all-gather or not)
                 self._check_rebuild_full_params(p)
                 # e.g., when world_size == 1
-                if not p._is_sharded:  # type: ignore[attr-defined]
+                if not p._wrapper__is_sharded:  # type: ignore[attr-defined]
                     if mixed_precision_cast_ran:
-                        # p.data should be the same type as p._mp_shard, and it
+                        # p.data should be the same type as p._wrapper_mp_shard, and it
                         # is safe to free.
-                        assert p.data.dtype == p._mp_shard.dtype
+                        assert p.dtype == p._wrapper_mp_shard.dtype
                         # Safe to free because p.data points to the mp shard.
-                        output_tensors.append((p.data, True))
+                        output_tensors.append((p, True))
                     else:
                         # p.data points to the unsharded parameter, so not safe to
                         # free.
-                        output_tensors.append((p.data, False))
+                        output_tensors.append((p, False))
                     continue
                 # If full param has been rebuilt or has not been freed, no need to call all gather
                 elif (
-                    p._full_param_padded.storage().size()  # type: ignore[attr-defined]
-                    == p._full_param_padded.size().numel()  # type: ignore[attr-defined]
+                    p._wrapper__full_param_padded.storage().size()  # type: ignore[attr-defined]
+                    == p._wrapper__full_param_padded.size().numel()  # type: ignore[attr-defined]
                 ):
                     # Check that the full param is in the expected precision, if
                     # training with mixed precision
                     if mixed_precision_cast_ran:
-                        if p._full_param_padded.dtype != self.mixed_precision.param_dtype:
+                        if p._wrapper__full_param_padded.dtype != self.mixed_precision.param_dtype:
                             raise ValueError(
                                 "_rebuild_full_params: Expected full param to be "
                                 f"of type {self.mixed_precision.param_dtype}, "
-                                f"but got {p._full_param_padded.dtype}!"
+                                f"but got {p._wrapper__full_param_padded.dtype}!"
                             )
                     # output is full_param_padded which can be freed depending
                     # on reshard_after_forward (this path is exercised by tests
                     # in test_fsdp_summon_full_params).
-                    output_tensors.append((p._full_param_padded, self.reshard_after_forward))
+                    output_tensors.append((p._wrapper__full_param_padded, self.reshard_after_forward))
 
-                    self._update_p_data(p, output_tensor=p._full_param_padded)  # type: ignore[attr-defined]
+                    self._update_p_data(p, output_tensor=p._wrapper__full_param_padded)  # type: ignore[attr-defined]
                     continue
                 else:
                     # If full param has not been rebuilt or has been freed, call all gather
-                    p_data = p.data  # type: ignore[attr-defined]
-                    p_full_size = p._full_param_padded.size()  # type: ignore[attr-defined]
+                    p_full_size = p._wrapper__full_param_padded.size()  # type: ignore[attr-defined]
                     assert (
-                        p_full_size.numel() == p_data.numel() * self.world_size
+                        p_full_size.numel() == p.numel() * self.world_size
                     ), "Param full size should be equal to its shard size multiply world_size."
                     assert (
-                        p._full_param_padded.storage().size() == 0  # type: ignore[attr-defined]
+                        p._wrapper__full_param_padded.storage().size() == 0  # type: ignore[attr-defined]
                     ), "Full param's storage should have been freed before if all gather is needed."  # type: ignore[attr-defined]
                     if (
                         self._mixed_precision_enabled_for_params()
                         and force_full_precision
                     ):
-                        # p._full_param_padded has the reduced precision type,
+                        # p._wrapper__full_param_padded has the reduced precision type,
                         # but we need full precision rebuild as we're in
                         # _summon_full_params. Note that this is why
                         # _summon_full_params collects locally used params from
                         # _rebuild_full_params instead of relying on
-                        # p._full_param_padded, as it may not always be
+                        # p._wrapper__full_param_padded, as it may not always be
                         # allocated such as during mixed precision.
-                        output_tensor = p_data.new_zeros(p_full_size)
+                        output_tensor = p.new_zeros(p_full_size)
                     else:
                         # Allocate based on full size from all shards.
-                        _alloc_storage(p._full_param_padded, size=p_full_size)  # type: ignore[attr-defined]
-                        output_tensor = p._full_param_padded  # type: ignore[attr-defined]
+                        _alloc_storage(p._wrapper__full_param_padded, size=p_full_size)  # type: ignore[attr-defined]
+                        output_tensor = p._wrapper__full_param_padded  # type: ignore[attr-defined]
                     # Fill output_tensor with (p.data for each shard in self.world_size)
                     dist._all_gather_base(
-                        output_tensor, p_data, group=self.process_group
+                        output_tensor, p._wrapper_tensor, group=self.process_group
                     )
 
                     # The full parameter, which can be freed. Note that we
@@ -3268,7 +3273,7 @@ class FullyShardedDataParallel(nn.Module):
         """Make sure p.grad has the correct size/device, otherwise set it to None."""
         for p in self.params:
             if p.grad is not None and (
-                p.grad.size() != p._orig_size  # type: ignore[attr-defined]
+                p.grad.size() != p._wrapper__orig_size  # type: ignore[attr-defined]
                 or p.grad.device != p.device
             ):
                 offloaded: bool = p.grad.device != p.device
@@ -3277,20 +3282,20 @@ class FullyShardedDataParallel(nn.Module):
                         "`p.grad.device` and `p.device` should be the same " \
                         "if not offloading parameters to CPU"
                 prev_iter_outside_no_sync: bool = \
-                    p.grad.size() == p._local_shard.shape  # type: ignore[attr-defined]
+                    p.grad.size() == p._wrapper__local_shard.shape  # type: ignore[attr-defined]
                 # As long as the previous iteration was outside `no_sync()`,
-                # then we must save the gradient in `_saved_grad_shard`, even
+                # then we must save the gradient in `_wrapper__saved_grad_shard`, even
                 # if the current iteration is inside `no_sync()`. This is to
                 # prepare for the next iteration outside `no_sync()`, which may
                 # try to accumulate gradients. FSDP accumulates gradients in
-                # the separate variable `p._saved_grad_shard` to leave `p.grad`
+                # the separate variable `p._wrapper__saved_grad_shard` to leave `p.grad`
                 # for the per-iteration gradient.
                 if prev_iter_outside_no_sync:
                     # FSDP currently does not support gradient accumulation
                     # outside `no_sync()` when using CPU offloading (see the
                     # warning in the class's docstring).
                     if not offloaded:
-                        p._saved_grad_shard = p.grad.data  # type: ignore[attr-defined]
+                        p._wrapper__saved_grad_shard = p.grad  # type: ignore[attr-defined]
                 p.grad = None
 
     @torch.no_grad()
@@ -3303,7 +3308,7 @@ class FullyShardedDataParallel(nn.Module):
         current_stream = torch.cuda.current_stream()
         for p in params:
             # e.g., world_size == 1 or self.sharding_strategy = NO_SHARD
-            if not p._is_sharded:  # type: ignore[attr-defined]
+            if not p._wrapper__is_sharded:  # type: ignore[attr-defined]
                 if (
                     self._mixed_precision_enabled_for_params()
                 ):
@@ -3311,14 +3316,14 @@ class FullyShardedDataParallel(nn.Module):
                 continue
             # Don't let PyTorch reuse this memory until all work in the current
             # stream is complete.
-            p._full_param_padded.record_stream(current_stream)  # type: ignore[attr-defined]
+            p._wrapper__full_param_padded.record_stream(current_stream)  # type: ignore[attr-defined]
             # There may be external references to the Tensor Storage that we
             # can't modify, such as references that are created by
             # ctx.save_for_backward in the forward pass. Thus when we
             # unshard parameters, we should reuse the original Tensor
             # Storage object and unshard it in-place. For now, just resize
             # the Storage to 0 to save memory.
-            _free_storage(p._full_param_padded)  # type: ignore[attr-defined]
+            _free_storage(p._wrapper__full_param_padded)  # type: ignore[attr-defined]
 
     @torch.no_grad()
     def _use_param_local_shard(
@@ -3331,10 +3336,10 @@ class FullyShardedDataParallel(nn.Module):
         for p in params:
             if self.cpu_offload.offload_params:
                 # Ensure local_shard resides in CPU if we are offloading params.
-                assert p._local_shard.device == torch.device(  # type: ignore[attr-defined]
+                assert p._wrapper__local_shard.device == torch.device(  # type: ignore[attr-defined]
                     "cpu"
-                ), "Expected p._local_shard to be on CPU"
-            p.data = p._local_shard  # type: ignore[attr-defined]
+                ), "Expected p._wrapper__local_shard to be on CPU"
+            p._wrapper_tensor = p._wrapper__local_shard  # type: ignore[attr-defined]
 
     def _assert_state(self, state: Union[TrainingState_, List[TrainingState_]]) -> None:
         """Assert we are in the given state."""
@@ -3989,7 +3994,7 @@ def _get_param_to_unflat_param_names(
             for param_name, param in module.named_parameters(recurse=False):
                 prefixed_param_names = [
                     _clean_param_name(prefix, param_info)
-                    for param_info in param._param_infos
+                    for param_info in param._wrapper__param_infos
                 ] if isinstance(param, FlatParameter) else [prefix + param_name]
                 # If this parameter has already been visited, then it is a
                 # shared parameter; then, only take the first parameter name

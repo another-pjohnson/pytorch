@@ -19,6 +19,7 @@ from typing import (
     Sequence,
     Tuple,
 )
+from torch.distributed.fsdp.shard_utils import ShadowParameter, ShadowTensor, bypass_state, BypassState
 
 import torch
 import torch.nn as nn
@@ -83,7 +84,7 @@ class ShardMetadata(NamedTuple):
     param_offsets: List[ParamOffset]
 
 
-class FlatParameter(nn.Parameter):
+class FlatParameter(ShadowParameter):
     """
     A parameter that is initialized from a list of parameters. All the
     parameters will be flattened and concatened to form the flat parameter.
@@ -106,7 +107,7 @@ class FlatParameter(nn.Parameter):
             raise ValueError("An non-empty list or tuple argument is needed")
 
         # Normally, all items are Parameters. But during pickling, we will have a single
-        # Tensor as the input and later in __init__, the correct _param_numels and _param_shapes
+        # Tensor as the input and later in __init__, the correct _wrapper__param_numels and _wrapper__param_shapes
         # are set.
         if not all(isinstance(p, (nn.Parameter, Tensor)) for p in params):
             incorrect_parameters = [
@@ -133,46 +134,44 @@ class FlatParameter(nn.Parameter):
             0,
         )
 
-        return super(FlatParameter, cls).__new__(
-            cls, data, requires_grad=requires_grad
-        )  # type: ignore[call-arg]
+        return super(FlatParameter, cls).__new__(cls, nn.Parameter(data))
 
     def __init__(self, params: Sequence[nn.Parameter], requires_grad: bool = True):
-        self._is_sharded = False
-        self._param_numels = [p.numel() for p in params]
+        self._wrapper__is_sharded = False
+        self._wrapper__param_numels = [p.numel() for p in params]
         # The total element numbers. This is equal to the summation of the
         # ``numel()`` of all the parameters.
-        self.full_numel = sum(self._param_numels)
-        assert self.numel() <= self.full_numel, (
+        self._wrapper_full_numel = sum(self._wrapper__param_numels)
+        assert self.numel() <= self._wrapper_full_numel, (
             "Parameter numbers mismatched. "
             f"The number of elements in FlatParameter: {self.numel()} vs. "
-            f"the number of elements in original parameters: {self.full_numel}."
+            f"the number of elements in original parameters: {self._wrapper_full_numel}."
         )
         # The shapes of each individual parameter.
-        self._param_shapes = [p.size() for p in params]
-        cumulative_sum = list(accumulate(self._param_numels))
+        self._wrapper__param_shapes = [p.size() for p in params]
+        cumulative_sum = list(accumulate(self._wrapper__param_numels))
         begin = [0] + cumulative_sum[:-1]
         end = [e - 1 for e in cumulative_sum]
 
-        self._param_infos: List[ParamInfo] = []
-        self._shared_param_infos: List[SharedParamInfo] = []
+        self._wrapper__param_infos: List[ParamInfo] = []
+        self._wrapper__shared_param_infos: List[SharedParamInfo] = []
 
         # The element offsets (begin/end pair) in the flat parameter of each
         # individual parameter.
-        self._param_offsets = list(zip(begin, end))
+        self._wrapper__param_offsets = list(zip(begin, end))
         # The indices (begin/end pair) of the parameters that are included in
         # this FlatParameter. The default value is all the parameters because
         # no sharding happen yet.
-        self._param_indice_in_shard = (0, len(self._param_infos) - 1)
+        self._wrapper__param_indice_in_shard = (0, len(self._wrapper__param_infos) - 1)
         # The offsets in each parameter that is included in the FlatParameter.
-        self._sharded_param_offsets: List[ParamOffset] = [
-            (0, numel) for numel in self._param_numels
+        self._wrapper__sharded_param_offsets: List[ParamOffset] = [
+            (0, numel) for numel in self._wrapper__param_numels
         ]
         # The number of padding elements.
         self.num_padded = 0
 
     def shard_by_offsets(self, start: int, end: int, num_padded: int) -> None:
-        assert self._is_sharded
+        assert self._wrapper__is_sharded
         if start < 0 or end < 0 or end < start:
             raise ValueError(
                 f"Shard the flatten parameter with an invalid offset pair {(start, end)}."
@@ -181,10 +180,10 @@ class FlatParameter(nn.Parameter):
         self.num_padded = num_padded
         if self.num_padded > _shard_size:
             raise ValueError("The number of padding is larger than the shard size.")
-        self._sharded_param_offsets.clear()
+        self._wrapper__sharded_param_offsets.clear()
 
         ranges = []
-        for idx, offset in enumerate(self._param_offsets):
+        for idx, offset in enumerate(self._wrapper__param_offsets):
             if start > offset[1] or end < offset[0]:
                 continue
             if start <= offset[0]:
@@ -194,14 +193,14 @@ class FlatParameter(nn.Parameter):
                 sharded_param_start = start - offset[0]
                 sharded_param_end = min(offset[1], end) - offset[0]
             ranges.append(idx)
-            self._sharded_param_offsets.append((sharded_param_start, sharded_param_end))
+            self._wrapper__sharded_param_offsets.append((sharded_param_start, sharded_param_end))
         if ranges:
-            self._param_indice_in_shard = (ranges[0], ranges[-1])
+            self._wrapper__param_indice_in_shard = (ranges[0], ranges[-1])
 
     def _offset_to_slice(self) -> slice:
-        if self._param_indice_in_shard[0] > self._param_indice_in_shard[1]:
+        if self._wrapper__param_indice_in_shard[0] > self._wrapper__param_indice_in_shard[1]:
             return slice(0, 0)
-        return slice(self._param_indice_in_shard[0], self._param_indice_in_shard[1] + 1)
+        return slice(self._wrapper__param_indice_in_shard[0], self._wrapper__param_indice_in_shard[1] + 1)
 
     def get_param_views(
         self, external_data: Optional[Tensor] = None
@@ -209,41 +208,42 @@ class FlatParameter(nn.Parameter):
         """Return a generator of views that map to the original parameters."""
         # Note, self.data could be sharded, so its numel is <= to the sum.
         assert (
-            self.data.numel() <= self.full_numel
-        ), f"Incorrect internal state {self.data.numel()} vs. {self.full_numel}"
+            self.numel() <= self._wrapper_full_numel
+        ), f"Incorrect internal state {self.numel()} vs. {self._wrapper_full_numel}"
         data = external_data if external_data is not None else self
-        if data.numel() != self.full_numel:
+        if data.numel() != self._wrapper_full_numel:
             raise ValueError(
-                f"Incorrect numel of supplied data: got {data.numel()} but expected {self.full_numel}"
+                f"Incorrect numel of supplied data: got {data.numel()} but expected {self._wrapper_full_numel}"
             )
+
         return (
             t.view(s)
-            for (t, s) in zip(data.split(self._param_numels), self._param_shapes)
+            for (t, s) in zip(data.split(self._wrapper__param_numels), self._wrapper__param_shapes)
         )
 
     @property
     def _num_unflattened_params(self) -> int:
         """Returns the number of unflattened parameters that comprise this
         flattened parameter."""
-        assert hasattr(self, "_param_infos"), \
-            "`_param_infos` has not been set, meaning this `FlatParameter` " \
+        assert hasattr(self, "_wrapper__param_infos"), \
+            "`_wrapper__param_infos` has not been set, meaning this `FlatParameter` " \
             "has not been initialized yet"
-        num_unflat_params = len(self._param_infos)
+        num_unflat_params = len(self._wrapper__param_infos)
         assert num_unflat_params > 0, "`FlatParameter` corresponding to 0 " \
             "unflattened parameters"
         return num_unflat_params
 
     @property
     def param_info(self) -> List[ParamInfo]:
-        return self._param_infos
+        return self._wrapper__param_infos
 
     @property
     def _param_names(self):
-        return [".".join([m, n]) if m else n for (m, _, n) in self._param_infos]
+        return [".".join([m, n]) if m else n for (m, _, n) in self._wrapper__param_infos]
 
     def metadata(self) -> Tuple[List[str], List[torch.Size], List[int]]:
         """Return tuple of (names, shapes, numels) metadata for this flat parameter."""
-        return self._param_names, self._param_shapes, self._param_numels
+        return self._wrapper__param_names, self._wrapper__param_shapes, self._wrapper__param_numels
 
     def shard_metadata(
         self,
@@ -253,10 +253,10 @@ class FlatParameter(nn.Parameter):
         metadata of this flat parameter.
         """
         return ShardMetadata(
-            self._param_names[self._offset_to_slice()],
-            self._param_shapes[self._offset_to_slice()],
-            self._param_numels[self._offset_to_slice()],
-            self._sharded_param_offsets[:],
+            self._wrapper__param_names[self._offset_to_slice()],
+            self._wrapper__param_shapes[self._offset_to_slice()],
+            self._wrapper__param_numels[self._offset_to_slice()],
+            self._wrapper__sharded_param_offsets[:],
         )
 
 
@@ -318,8 +318,8 @@ class FlattenParamsWrapper(nn.Module):
 
         params, param_infos, shared_param_infos = self._init_flatten_params()
         self.flat_param = FlatParameter(params, params[0].requires_grad)
-        self.flat_param._param_infos = param_infos
-        self.flat_param._shared_param_infos = shared_param_infos
+        self.flat_param._wrapper__param_infos = param_infos
+        self.flat_param._wrapper__shared_param_infos = shared_param_infos
 
         # This attribute is used to remember the flat_param inside the unflatten_params()
         # context. With this attribute, FSDP can access the flat parameter metadata
@@ -389,9 +389,9 @@ class FlattenParamsWrapper(nn.Module):
 
         assert self.flat_param is not None  # avoid mypy complain.
         # deregister the names as parameters
-        for _, m, n in self.flat_param._param_infos:
+        for _, m, n in self.flat_param._wrapper__param_infos:
             delattr(m, n)
-        for _, _, m, n, _, _ in self.flat_param._shared_param_infos:
+        for _, _, m, n, _, _ in self.flat_param._wrapper__shared_param_infos:
             delattr(m, n)
 
         # register the views as plain attributes
@@ -405,11 +405,24 @@ class FlattenParamsWrapper(nn.Module):
             self.flat_param is not None
         ), "Can not unflatten params as views when flat_param is None."
         ps = self._get_param_views()
-        for (_, m, n), p in zip(self.flat_param._param_infos, ps):
-            setattr(m, n, p)  # This will set as plain attr
+        with bypass_state(BypassState.WRAPPER_ONLY):
+            for (_, m, n), p in zip(self.flat_param._wrapper__param_infos, ps):
+                existing_param = getattr(m, n, None)
+                if isinstance(existing_param, ShadowTensor):
+                    existing_param._wrapper_tensor = p._wrapper_tensor
+                else:
+                    if isinstance(p, ShadowTensor):
+                        wrapped_tensor = p
+                    else:
+                        wrapped_tensor = ShadowTensor(p)
+                    setattr(m, n, wrapped_tensor)  # This will set as plain attr
 
-        for (_, _, m, n, shared_m, shared_n) in self.flat_param._shared_param_infos:
-            setattr(m, n, getattr(shared_m, shared_n))
+        for (_, _, m, n, shared_m, shared_n) in self.flat_param._wrapper__shared_param_infos:
+            existing_param = getattr(shared_m, shared_n)
+            if isinstance(existing_param, ShadowTensor):
+                existing_param.tensor = p
+            else:
+                setattr(m, n, ShadowTensor(existing_param))  # This will set as plain attr
 
     def _unflatten_params(self) -> None:
         """Undo flattening and create separate parameters from the already flattened
@@ -419,11 +432,11 @@ class FlattenParamsWrapper(nn.Module):
             self.flat_param is not None
         ), "Can not unflatten params when flat_param is None."
         ps = self._get_param_views()
-        for (_, m, n), p in zip(self.flat_param._param_infos, ps):
+        for (_, m, n), p in zip(self.flat_param._wrapper__param_infos, ps):
             if hasattr(m, n):
                 delattr(m, n)
             m.register_parameter(n, nn.Parameter(p))
-        for (_, _, m, n, shared_m, shared_n) in self.flat_param._shared_param_infos:
+        for (_, _, m, n, shared_m, shared_n) in self.flat_param._wrapper__shared_param_infos:
             if hasattr(m, n):
                 delattr(m, n)
             m.register_parameter(n, getattr(shared_m, shared_n))
@@ -449,6 +462,7 @@ class FlattenParamsWrapper(nn.Module):
                 self._flatten_params(self.orig_flat_param[0])
                 self.orig_flat_param[0] = None
 
+    @bypass_state
     def _get_param_views(
         self, external_data: Optional[Tensor] = None
     ) -> Iterator[Tensor]:
